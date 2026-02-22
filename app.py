@@ -6,7 +6,6 @@ import numpy as np
 import joblib
 import plotly.express as px
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score
 from xgboost import XGBRegressor
 from datetime import timedelta
 
@@ -20,25 +19,42 @@ def download_data():
 
         st.info("Downloading dataset from Kaggle...")
 
+        # ✅ Check if secrets exist
+        if "kaggle" not in st.secrets:
+            st.error("Kaggle credentials not found in Streamlit secrets.")
+            st.stop()
+
         os.makedirs("data", exist_ok=True)
 
+        # Set environment variables
         os.environ["KAGGLE_USERNAME"] = st.secrets["kaggle"]["username"]
         os.environ["KAGGLE_KEY"] = st.secrets["kaggle"]["key"]
 
-        from kaggle.api.kaggle_api_extended import KaggleApi
+        try:
+            from kaggle.api.kaggle_api_extended import KaggleApi
 
-        api = KaggleApi()
-        api.authenticate()
+            api = KaggleApi()
+            api.authenticate()
 
-        api.competition_download_files(
-            "rossmann-store-sales",
-            path="data"
-        )
+            api.competition_download_files(
+                "rossmann-store-sales",
+                path="data"
+            )
 
-        with zipfile.ZipFile("data/rossmann-store-sales.zip", 'r') as zip_ref:
-            zip_ref.extractall("data")
+            # Extract ZIP
+            zip_path = "data/rossmann-store-sales.zip"
 
-        st.success("Dataset downloaded successfully!")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall("data")
+
+            os.remove(zip_path)
+
+            st.success("Dataset downloaded successfully!")
+
+        except Exception as e:
+            st.error("Error downloading dataset. Make sure you joined the competition on Kaggle.")
+            st.exception(e)
+            st.stop()
 
 download_data()
 
@@ -62,22 +78,29 @@ def train_model():
 
     if not os.path.exists("model/sales_model.pkl"):
 
-        st.info("Training model...")
+        st.info("Training model... (first run may take 2-3 minutes)")
 
         os.makedirs("model", exist_ok=True)
 
         df_model = df.copy()
 
+        # Date features
         df_model['Year'] = df_model['Date'].dt.year
         df_model['Month'] = df_model['Date'].dt.month
         df_model['Day'] = df_model['Date'].dt.day
-        df_model['WeekOfYear'] = df_model['Date'].dt.isocalendar().week
+        df_model['WeekOfYear'] = df_model['Date'].dt.isocalendar().week.astype(int)
 
         df_model = df_model.sort_values(["Store", "Date"])
 
+        # Lag features
         df_model['Lag_1'] = df_model.groupby("Store")["Sales"].shift(1)
         df_model['Lag_7'] = df_model.groupby("Store")["Sales"].shift(7)
-        df_model['Rolling_7'] = df_model.groupby("Store")["Sales"].shift(1).rolling(7).mean()
+        df_model['Rolling_7'] = (
+            df_model.groupby("Store")["Sales"]
+            .shift(1)
+            .rolling(7)
+            .mean()
+        )
 
         df_model = df_model[df_model["Open"] == 1]
         df_model = df_model.fillna(0)
@@ -99,7 +122,8 @@ def train_model():
         model = XGBRegressor(
             n_estimators=300,
             learning_rate=0.05,
-            max_depth=6
+            max_depth=6,
+            random_state=42
         )
 
         model.fit(X_train, y_train)
@@ -163,7 +187,7 @@ if menu == "30-Day Forecast":
         forecast_df["Year"] = forecast_df["Date"].dt.year
         forecast_df["Month"] = forecast_df["Date"].dt.month
         forecast_df["Day"] = forecast_df["Date"].dt.day
-        forecast_df["WeekOfYear"] = forecast_df["Date"].dt.isocalendar().week
+        forecast_df["WeekOfYear"] = forecast_df["Date"].dt.isocalendar().week.astype(int)
 
         competition = df[df["Store"] == store_id]["CompetitionDistance"].iloc[0]
         forecast_df["CompetitionDistance"] = competition

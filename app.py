@@ -1,62 +1,14 @@
 import os
-import zipfile
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 import plotly.express as px
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
 from xgboost import XGBRegressor
-from datetime import timedelta
 
 st.set_page_config(page_title="Retail Sales Forecast", layout="wide")
-
-# -------------------------------------------------------
-# DOWNLOAD DATA FROM KAGGLE
-# -------------------------------------------------------
-def download_data():
-    if not os.path.exists("data/train.csv"):
-
-        st.info("Downloading dataset from Kaggle...")
-
-        # ✅ Check if secrets exist
-        if "kaggle" not in st.secrets:
-            st.error("Kaggle credentials not found in Streamlit secrets.")
-            st.stop()
-
-        os.makedirs("data", exist_ok=True)
-
-        # Set environment variables
-        os.environ["KAGGLE_USERNAME"] = st.secrets["kaggle"]["username"]
-        os.environ["KAGGLE_KEY"] = st.secrets["kaggle"]["key"]
-
-        try:
-            from kaggle.api.kaggle_api_extended import KaggleApi
-
-            api = KaggleApi()
-            api.authenticate()
-
-            api.competition_download_files(
-                "rossmann-store-sales",
-                path="data"
-            )
-
-            # Extract ZIP
-            zip_path = "data/rossmann-store-sales.zip"
-
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall("data")
-
-            os.remove(zip_path)
-
-            st.success("Dataset downloaded successfully!")
-
-        except Exception as e:
-            st.error("Error downloading dataset. Make sure you joined the competition on Kaggle.")
-            st.exception(e)
-            st.stop()
-
-download_data()
 
 # -------------------------------------------------------
 # LOAD DATA
@@ -66,54 +18,59 @@ def load_data():
     train = pd.read_csv("data/train.csv")
     store = pd.read_csv("data/store.csv")
     df = train.merge(store, on="Store", how="left")
-    df['Date'] = pd.to_datetime(df['Date'])
+    df["Date"] = pd.to_datetime(df["Date"])
     return df
 
 df = load_data()
 
 # -------------------------------------------------------
-# TRAIN MODEL IF NOT EXISTS
+# FEATURE ENGINEERING
+# -------------------------------------------------------
+def prepare_features(data):
+    data = data.copy()
+
+    data["Year"] = data["Date"].dt.year
+    data["Month"] = data["Date"].dt.month
+    data["Day"] = data["Date"].dt.day
+    data["WeekOfYear"] = data["Date"].dt.isocalendar().week.astype(int)
+
+    data = data.sort_values(["Store", "Date"])
+
+    data["Lag_1"] = data.groupby("Store")["Sales"].shift(1)
+    data["Lag_7"] = data.groupby("Store")["Sales"].shift(7)
+    data["Rolling_7"] = (
+        data.groupby("Store")["Sales"]
+        .shift(1)
+        .rolling(7)
+        .mean()
+    )
+
+    data = data[data["Open"] == 1]
+    data = data.fillna(0)
+
+    return data
+
+df_model = prepare_features(df)
+
+features = [
+    'Store', 'DayOfWeek', 'Promo', 'SchoolHoliday',
+    'Year', 'Month', 'Day', 'WeekOfYear',
+    'CompetitionDistance',
+    'Lag_1', 'Lag_7', 'Rolling_7'
+]
+
+# -------------------------------------------------------
+# TRAIN MODEL
 # -------------------------------------------------------
 def train_model():
-
     if not os.path.exists("model/sales_model.pkl"):
 
-        st.info("Training model... (first run may take 2-3 minutes)")
+        st.info("Training model... (First run may take 2-3 minutes)")
 
         os.makedirs("model", exist_ok=True)
 
-        df_model = df.copy()
-
-        # Date features
-        df_model['Year'] = df_model['Date'].dt.year
-        df_model['Month'] = df_model['Date'].dt.month
-        df_model['Day'] = df_model['Date'].dt.day
-        df_model['WeekOfYear'] = df_model['Date'].dt.isocalendar().week.astype(int)
-
-        df_model = df_model.sort_values(["Store", "Date"])
-
-        # Lag features
-        df_model['Lag_1'] = df_model.groupby("Store")["Sales"].shift(1)
-        df_model['Lag_7'] = df_model.groupby("Store")["Sales"].shift(7)
-        df_model['Rolling_7'] = (
-            df_model.groupby("Store")["Sales"]
-            .shift(1)
-            .rolling(7)
-            .mean()
-        )
-
-        df_model = df_model[df_model["Open"] == 1]
-        df_model = df_model.fillna(0)
-
-        features = [
-            'Store', 'DayOfWeek', 'Promo', 'SchoolHoliday',
-            'Year', 'Month', 'Day', 'WeekOfYear',
-            'CompetitionDistance',
-            'Lag_1', 'Lag_7', 'Rolling_7'
-        ]
-
         X = df_model[features]
-        y = df_model['Sales']
+        y = df_model["Sales"]
 
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
@@ -128,16 +85,18 @@ def train_model():
 
         model.fit(X_train, y_train)
 
-        joblib.dump(model, "model/sales_model.pkl")
+        preds = model.predict(X_test)
+        score = r2_score(y_test, preds)
 
-        st.success("Model trained successfully!")
+        joblib.dump(model, "model/sales_model.pkl")
+        st.success(f"Model trained! R² Score: {score:.3f}")
 
 train_model()
 
 model = joblib.load("model/sales_model.pkl")
 
 # -------------------------------------------------------
-# DASHBOARD UI
+# UI
 # -------------------------------------------------------
 st.title("🏬 Retail Sales Intelligence Dashboard")
 
@@ -176,44 +135,52 @@ if menu == "30-Day Forecast":
 
     if st.button("Generate Forecast"):
 
+        store_data = df[df["Store"] == store_id].sort_values("Date")
+        last_7_days = list(store_data["Sales"].tail(7))
+
         future_dates = pd.date_range(start=start_date, periods=30)
+        predictions = []
 
-        forecast_df = pd.DataFrame()
-        forecast_df["Date"] = future_dates
-        forecast_df["Store"] = store_id
-        forecast_df["DayOfWeek"] = forecast_df["Date"].dt.dayofweek + 1
-        forecast_df["Promo"] = 0
-        forecast_df["SchoolHoliday"] = 0
-        forecast_df["Year"] = forecast_df["Date"].dt.year
-        forecast_df["Month"] = forecast_df["Date"].dt.month
-        forecast_df["Day"] = forecast_df["Date"].dt.day
-        forecast_df["WeekOfYear"] = forecast_df["Date"].dt.isocalendar().week.astype(int)
+        for date in future_dates:
 
-        competition = df[df["Store"] == store_id]["CompetitionDistance"].iloc[0]
-        forecast_df["CompetitionDistance"] = competition
+            lag_1 = last_7_days[-1]
+            lag_7 = last_7_days[0]
+            rolling_7 = np.mean(last_7_days)
 
-        last_sales = df[df["Store"] == store_id]["Sales"].iloc[-1]
+            row = pd.DataFrame({
+                "Store": [store_id],
+                "DayOfWeek": [date.dayofweek + 1],
+                "Promo": [0],
+                "SchoolHoliday": [0],
+                "Year": [date.year],
+                "Month": [date.month],
+                "Day": [date.day],
+                "WeekOfYear": [date.isocalendar().week],
+                "CompetitionDistance": [
+                    store_data["CompetitionDistance"].iloc[0]
+                ],
+                "Lag_1": [lag_1],
+                "Lag_7": [lag_7],
+                "Rolling_7": [rolling_7]
+            })
 
-        forecast_df["Lag_1"] = last_sales
-        forecast_df["Lag_7"] = last_sales
-        forecast_df["Rolling_7"] = last_sales
+            pred = model.predict(row)[0]
+            predictions.append(pred)
 
-        features = [
-            'Store', 'DayOfWeek', 'Promo', 'SchoolHoliday',
-            'Year', 'Month', 'Day', 'WeekOfYear',
-            'CompetitionDistance',
-            'Lag_1', 'Lag_7', 'Rolling_7'
-        ]
+            last_7_days.append(pred)
+            last_7_days.pop(0)
 
-        preds = model.predict(forecast_df[features])
-        forecast_df["Predicted Sales"] = preds
+        forecast_df = pd.DataFrame({
+            "Date": future_dates,
+            "Predicted Sales": predictions
+        })
 
         fig = px.line(
             forecast_df,
             x="Date",
             y="Predicted Sales",
             template="plotly_white",
-            title="30-Day Sales Forecast"
+            title="30-Day Rolling Sales Forecast"
         )
 
         st.plotly_chart(fig, use_container_width=True)
